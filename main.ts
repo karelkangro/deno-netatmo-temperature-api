@@ -73,6 +73,23 @@ async function refreshToken(previousRefreshToken: string): Promise<TokenData> {
   };
 }
 
+async function getOrInitializeRefreshToken(kv: Deno.Kv): Promise<string> {
+  // First try to get from KV
+  const storedToken = await kv.get(["refreshToken"]);
+
+  if (storedToken.value) {
+    return storedToken.value as string;
+  }
+
+  // If not in KV, use the initial token from .env
+  const initialToken = env["NETATMO_REFRESH_TOKEN"];
+
+  // Store it in KV for future use
+  await kv.set(["refreshToken"], initialToken);
+
+  return initialToken;
+}
+
 async function fetchWeatherData(accessToken: string): Promise<WeatherData> {
   const params = new URLSearchParams({
     client_id: env["NETATMO_APP_ID"],
@@ -114,10 +131,7 @@ async function updateWeatherData() {
 
     if (!currentTokens) {
       // Initial tokens must be set manually
-      const initialRefreshToken = env["NETATMO_REFRESH_TOKEN"];
-      if (!initialRefreshToken) {
-        throw new Error("Initial refresh token not found in environment");
-      }
+      const initialRefreshToken = await getOrInitializeRefreshToken(kv);
       currentTokens = await refreshToken(initialRefreshToken);
       await kv.set(["tokens"], currentTokens);
     }

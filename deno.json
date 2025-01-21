@@ -3,5 +3,11 @@
     "allowJs": true,
     "lib": ["deno.window", "deno.unstable"],
     "strict": true
+  },
+  "deploy": {
+    "project": "87cc2228-e320-4c9e-a89f-3baba7173c90",
+    "exclude": ["**/node_modules"],
+    "include": [],
+    "entrypoint": "main.ts"
   }
 }
