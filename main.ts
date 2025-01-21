@@ -73,23 +73,40 @@ async function refreshToken(previousRefreshToken: string): Promise<TokenData> {
   };
 }
 
-async function getOrInitializeRefreshToken(kv: Deno.Kv): Promise<string> {
-  // First try to get from KV
-  const storedToken = await kv.get(["refreshToken"]);
-  const envToken = env["NETATMO_REFRESH_TOKEN"];
-
-  // If env token is different from stored token, use the new one
-  if (envToken && (!storedToken.value || storedToken.value !== envToken)) {
-    // Store new token from env
-    await kv.set(["refreshToken"], envToken);
-    return envToken;
+async function initializeTokens(kv: Deno.Kv): Promise<void> {
+  const envRefreshToken = env["NETATMO_REFRESH_TOKEN"];
+  if (!envRefreshToken) {
+    throw new Error("NETATMO_REFRESH_TOKEN not set in environment");
   }
 
-  if (storedToken.value) {
-    return storedToken.value as string;
+  // Always initialize KV with .env refresh token on startup
+  await kv.set(["refreshToken"], envRefreshToken);
+
+  // Verify the token works by attempting to get an access token
+  try {
+    const tokenResponse = await refreshToken(envRefreshToken);
+    await kv.set(["accessToken"], tokenResponse.access_token);
+    await kv.set(["refreshToken"], tokenResponse.refresh_token);
+    console.log("Tokens initialized successfully");
+  } catch (error) {
+    await kv.delete(["refreshToken"]);
+    await kv.delete(["accessToken"]);
+    throw new Error(`Invalid refresh token. Please generate a new one in Netatmo console. Error: ${error.message}`);
+  }
+}
+
+async function getStoredTokens(kv: Deno.Kv): Promise<{ refreshToken: string; accessToken?: string }> {
+  const refreshToken = await kv.get(["refreshToken"]);
+  const accessToken = await kv.get(["accessToken"]);
+
+  if (!refreshToken.value) {
+    throw new Error("No refresh token found. Need to initialize first.");
   }
 
-  throw new Error("No valid refresh token available");
+  return {
+    refreshToken: refreshToken.value as string,
+    accessToken: accessToken.value as string | undefined
+  };
 }
 
 async function fetchWeatherData(accessToken: string): Promise<WeatherData> {
@@ -128,41 +145,43 @@ async function fetchWeatherData(accessToken: string): Promise<WeatherData> {
 
 async function updateWeatherData() {
   try {
-    const tokenData = await kv.get<TokenData>(["tokens"]);
-    let currentTokens = tokenData.value;
+    const kv = await Deno.openKv();
+    const tokens = await getStoredTokens(kv);
 
-    if (!currentTokens) {
-      // Initial tokens must be set manually
-      const initialRefreshToken = await getOrInitializeRefreshToken(kv);
-      currentTokens = await refreshToken(initialRefreshToken);
-      await kv.set(["tokens"], currentTokens);
+    let accessToken = tokens.accessToken;
+    if (!accessToken) {
+      const tokenResponse = await refreshToken(tokens.refreshToken);
+      accessToken = tokenResponse.access_token;
+      await kv.set(["accessToken"], accessToken);
+      await kv.set(["refreshToken"], tokenResponse.refresh_token);
     }
 
-    // Gets new tokens using the current refresh token
-    const newTokens = await refreshToken(currentTokens.refresh_token);
-    // Saves the new tokens in KV store
-    await kv.set(["tokens"], newTokens);
-
-    // Fetch weather data
-    const weatherData = await fetchWeatherData(newTokens.access_token);
-    await kv.set(["weather"], weatherData);
-
+    const weatherData = await fetchWeatherData(accessToken);
+    await kv.set(["weatherData"], weatherData);
     console.log("Weather data updated:", weatherData);
   } catch (error) {
     console.error("Error updating weather data:", error);
   }
 }
 
-// Initial update
-await updateWeatherData();
+// Update your main function:
+async function main() {
+  const kv = await Deno.openKv();
 
-// Schedule updates every 30 seconds
-setInterval(updateWeatherData, 30000);
+  // Initialize on startup
+  await initializeTokens(kv);
 
-// Simple HTTP server to check the latest data
-Deno.serve(async () => {
-  const weatherData = await kv.get(["weather"]);
-  return new Response(JSON.stringify(weatherData.value), {
-    headers: { "Content-Type": "application/json" },
+  // Start the update loop
+  await updateWeatherData();
+  setInterval(updateWeatherData, 30000);
+
+  // Start the server
+  Deno.serve(async () => {
+    const weatherData = await kv.get(["weatherData"]);
+    return new Response(JSON.stringify(weatherData.value), {
+      headers: { "Content-Type": "application/json" },
+    });
   });
-});
+}
+
+await main();
