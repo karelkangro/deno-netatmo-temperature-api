@@ -1,7 +1,22 @@
 /// <reference lib="deno.unstable" />
 import { load } from "https://deno.land/std@0.224.0/dotenv/mod.ts";
 
-const env = await load();
+let env: Record<string, string>;
+
+if (Deno.env.get("DENO_DEPLOYMENT_ID")) {
+  // Production: Use Deno Deploy env vars
+  env = {
+    NETATMO_REFRESH_TOKEN: Deno.env.get("NETATMO_REFRESH_TOKEN") ?? "",
+    NETATMO_APP_ID: Deno.env.get("NETATMO_APP_ID") ?? "",
+    NETATMO_CLIENT_SECRET: Deno.env.get("NETATMO_CLIENT_SECRET") ?? "",
+    NETATMO_DEVICE_ID: Deno.env.get("NETATMO_DEVICE_ID") ?? "",
+    NETATMO_OUTDOOR_MODULE_ID: Deno.env.get("NETATMO_OUTDOOR_MODULE_ID") ?? "",
+  };
+} else {
+  // Local development: Use .env file
+  env = await load();
+}
+
 const kv = await Deno.openKv();
 
 const NETATMO_API_BASE = "https://api.netatmo.com";
@@ -44,54 +59,65 @@ interface NetatmoResponse {
 }
 
 async function refreshToken(previousRefreshToken: string): Promise<TokenData> {
-  const formData = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: previousRefreshToken,
-    client_id: env["NETATMO_APP_ID"],
-    client_secret: env["NETATMO_CLIENT_SECRET"],
-  });
+  try {
+    const formData = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: previousRefreshToken,
+      client_id: env["NETATMO_APP_ID"],
+      client_secret: env["NETATMO_CLIENT_SECRET"],
+    });
 
-  const response = await fetch(REFRESH_TOKEN_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: formData,
-  });
+    const response = await fetch(REFRESH_TOKEN_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: formData,
+    });
 
-  if (!response.ok) {
-    // Add error details
-    const errorText = await response.text();
-    throw new Error(`Token refresh failed: ${response.statusText}\nDetails: ${errorText}`);
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("Token refresh failed:", errorText);
+
+      // If the token is invalid, try using the one from .env
+      const envRefreshToken = env["NETATMO_REFRESH_TOKEN"];
+      if (envRefreshToken && envRefreshToken !== previousRefreshToken) {
+        console.log("Attempting to use refresh token from .env...");
+        return refreshToken(envRefreshToken);
+      }
+
+      throw new Error(`Token refresh failed: ${response.statusText}\nDetails: ${errorText}`);
+    }
+
+    const data = await response.json();
+    return {
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+    };
+  } catch (error) {
+    throw error;
   }
-
-  const data = await response.json();
-
-  return {
-    access_token: data.access_token,
-    refresh_token: data.refresh_token,
-  };
 }
 
 async function initializeTokens(kv: Deno.Kv): Promise<void> {
-  const envRefreshToken = env["NETATMO_REFRESH_TOKEN"];
-  if (!envRefreshToken) {
-    throw new Error("NETATMO_REFRESH_TOKEN not set in environment");
-  }
-
-  // Always initialize KV with .env refresh token on startup
-  await kv.set(["refreshToken"], envRefreshToken);
-
-  // Verify the token works by attempting to get an access token
   try {
-    const tokenResponse = await refreshToken(envRefreshToken);
+    // First try to get existing token from KV
+    const existingToken = await kv.get(["refreshToken"]);
+    const envRefreshToken = env["NETATMO_REFRESH_TOKEN"];
+
+    const tokenToUse = existingToken.value as string || envRefreshToken;
+
+    if (!tokenToUse) {
+      throw new Error("No refresh token available in KV or environment");
+    }
+
+    const tokenResponse = await refreshToken(tokenToUse);
     await kv.set(["accessToken"], tokenResponse.access_token);
     await kv.set(["refreshToken"], tokenResponse.refresh_token);
     console.log("Tokens initialized successfully");
   } catch (error) {
-    await kv.delete(["refreshToken"]);
-    await kv.delete(["accessToken"]);
-    throw new Error(`Invalid refresh token. Please generate a new one in Netatmo console. Error: ${error.message}`);
+    console.error("Token initialization error:", error);
+    throw error;
   }
 }
 
@@ -145,7 +171,6 @@ async function fetchWeatherData(accessToken: string): Promise<WeatherData> {
 
 async function updateWeatherData() {
   try {
-    const kv = await Deno.openKv();
     const tokens = await getStoredTokens(kv);
 
     let accessToken = tokens.accessToken;
@@ -166,8 +191,6 @@ async function updateWeatherData() {
 
 // Update your main function:
 async function main() {
-  const kv = await Deno.openKv();
-
   // Initialize on startup
   await initializeTokens(kv);
 
