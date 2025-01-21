@@ -11,11 +11,16 @@ if (Deno.env.get("DENO_DEPLOYMENT_ID")) {
     NETATMO_CLIENT_SECRET: Deno.env.get("NETATMO_CLIENT_SECRET") ?? "",
     NETATMO_DEVICE_ID: Deno.env.get("NETATMO_DEVICE_ID") ?? "",
     NETATMO_OUTDOOR_MODULE_ID: Deno.env.get("NETATMO_OUTDOOR_MODULE_ID") ?? "",
+    ALLOWED_ORIGINS: Deno.env.get("ALLOWED_ORIGINS") ?? "",
+    ENVIRONMENT: Deno.env.get("ENVIRONMENT") ?? "production",
   };
 } else {
   // Local development: Use .env file
   env = await load();
 }
+
+const ALLOWED_ORIGINS = env["ALLOWED_ORIGINS"]?.split(",").map(origin => origin.trim()) || [];
+const ENVIRONMENT = env["ENVIRONMENT"] || "production";
 
 const kv = await Deno.openKv();
 
@@ -199,10 +204,35 @@ async function main() {
   setInterval(updateWeatherData, 30000);
 
   // Start the server
-  Deno.serve(async () => {
+  Deno.serve(async (req) => {
+    const origin = req.headers.get("Origin") || "";
+    let allowedOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
+
+    if (ENVIRONMENT === "development" && !ALLOWED_ORIGINS.includes(origin)) {
+      console.warn(`Allowing origin ${origin} in development mode.`);
+      allowedOrigin = origin;
+    }
+
+    if (req.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": allowedOrigin,
+          "Access-Control-Allow-Methods": "GET",
+          "Access-Control-Allow-Headers": "Content-Type",
+          "Access-Control-Max-Age": "86400",
+        },
+      });
+    }
+
     const weatherData = await kv.get(["weatherData"]);
     return new Response(JSON.stringify(weatherData.value), {
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": allowedOrigin,
+        "Access-Control-Allow-Methods": "GET",
+        "Access-Control-Allow-Headers": "Content-Type",
+      },
     });
   });
 }
